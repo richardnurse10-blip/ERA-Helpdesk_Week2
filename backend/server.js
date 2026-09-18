@@ -68,7 +68,37 @@ app.get("/tickets/open", (req, res) => {
     });
 });
 
-// GET /tickets/:id --returns a singel ticket by ID
+// GET /tickets/details --returns all tickets with JOIN-ed user & department names
+
+app.get("/tickets/details", (req, res) => {
+    const sql = "SELECT t.id AS ticket_id, t.title, t.description, t.priority, t.status, t.created_at, CONCAT(u1.first_name, ' ', u1.last_name) AS submitted_by, CONCAT(u2.first_name, ' ', u2.last_name) AS assigned_to, d.name AS department FROM tickets t JOIN users u1 ON t.submitted_by = u1.id LEFT JOIN users u2 ON t.assigned_to = u2.id JOIN departments d ON t.department_id = d.id ORDER BY d.created_at DESC";
+    db.query(sql, (error, results) => {
+        if (error) {
+            console.error("error getting ticket details:", error);
+            return res.status(500).json({error: "failed to get ticket details"});
+        }
+        res.json(results);
+    });
+});
+
+// GET /tickets/:id/details --returns one ticket with JOIN-ed names
+
+app.get("/tickets/:id/details", (req, res) => {
+    const ticketId = req.params.id;
+    const sql = "SELECT t.id AS ticket_id, t.title, t.description, t.priority, t.status, t.created_at, CONCAT(u1.first_name, ' ', u1.last_name) AS submitted_by, CONCAT(u2.first_name, ' ', u2.last_name) AS assigned_to, d.name AS department FROM tickets t JOIN users u1 ON t.submitted_by = u1.id LEFT JOIN users u2 ON t.assigned_to = u2.id JOIN departments d ON t.department_id = d.id WHERE t.id = ?";
+    db.query(sql, [ticketId], (error, results) => {
+        if (error) {
+            console.error("error getting ticket details:", error);
+            return res.status(500).json({error: "failed to get ticket details"});
+        }
+        if (results.length === 0) {
+            return res.status(404).json({error: "ticket not found"});
+        }
+        res.json(results[0]);
+    });
+});
+
+// GET /tickets/:id --returns a single ticket by ID
 
 app.get("/tickets/:id", (req, res) => {
     const ticketId = req.params.id;
@@ -82,6 +112,201 @@ app.get("/tickets/:id", (req, res) => {
             return res.status(404).json({error: "ticket not found"});
         }
         res.json(results[0]);
+    });
+});
+
+// POST/ users --creates a new user
+
+app.post("/users", (req, res) => {
+    const {first_name, last_name, email, password, role, department_id} = req.body;
+
+    // check required fields
+    if (!first_name || !last_name || !email || !password) {
+        return res.status(400).json({error: "first_name, last_name, email & password are requried"});
+    }
+
+    // password rule 1: minimum 8 characters
+    if (password.length < 8) {
+        return res.status(400).json({error: "password must be at least 8 characters long"});
+    }
+
+    // password rule 2: at least 1 special character
+    const specialChar = /[!@#$%]/;
+    if (!specialChar.test(password)) {
+        return res.status(400).json({error: "password must include at least 1 special character: ! @ # $ %"});
+    }
+    const sql = "INSERT INTO users(first_name, last_name, email, password, role, department_id) VALUES (?, ?, ?, ?, ?, ?)";
+    const userRole = role || "employee";
+    const deptId = department_id || null;
+
+    db.query (sql, [first_name, last_name, email, password, userRole, deptId], (error, results) => {
+        if (error) {
+            console.error("error creating user:", error);
+            return res.status(500).json({error: "failed to create user"});
+        }
+        res.status(201).json({
+            message: "user created successfully", 
+            userId: results.insertId
+        });
+    });
+});
+
+// POST/ tickets --creates a new ticket in mySQL & automatically logs action into MongoDB
+
+app.post("/tickets", async (req, res) => {
+    const {title, desricption, priority, status, submitted_by, assigned_to, department_id} = req.body;
+
+// validate required fields
+
+    if (!title || !submitted_by) {
+        return res.status(400).json({error: "title and submitted_by are required"});
+    }
+    const ticketPriority = priority || "medium";
+    const ticketStatus = status || "open";
+    const assignedTo = assigned_to || null;
+    const deptId = department_id || null;
+
+    const sql = "INSERT INTO tickets (title, description, priority, status, submitted_by, assigned_to, department_id) VALUES (?, ?, ?, ?, ?, ?, ?)";
+    db.query(sql, [title, desricption, ticketPriority, ticketStatus, submitted_by, assignedTo, deptId], async (error, results) => {
+        if (error) {
+            console.error("error creating ticket:", error);
+            return res.status(500).json({error: "failed to create ticket"});
+        }
+        const newTicketId = results.insertId;
+
+// automatically log this action to MongoDB
+
+        try {
+            const mongoDb = getMongo();
+            await mongoDb.collection ("activity_logs").insertOne ({
+                action: "ticket_created",
+                user_id: submitted_by,
+                ticket_id: newTicketId,
+                details: `ticket created: ${title}`,
+                timestamp: new Date()
+            });
+        } catch (mongoError) {
+            console.error("failed to log activity:", mongoError)
+
+// do not fail the request if logging fails --means you can still send ticket, even if it fails
+
+        }
+        res.status(201).json({
+            message: "ticket created successfully",
+            ticketId: newTicketId
+        });
+    });
+});
+
+// POST/ticket-notes -- adds a note to a ticket in mongoDb
+
+app.post("/ticket-notes", async (req,res) => {
+    const {ticket_id, note, added_by} = req.body;
+    if(!ticket_id || !note || !added_by) {
+        return res.status(400).json({error: "ticket ID, and note are required"});
+    }
+    try {
+        const mongoDb = getMongo();
+        const result = await mongoDb.collection("ticket_notes").insertOne({
+            ticket_id: parseInt(ticket_id),
+            note: note,
+            added_by: added_by,
+            created_at: new Date()
+        });
+        res.status(201).json({
+            message: "note added successfully",
+            noteId: result.insertedId
+        });
+    } catch(error) {
+        console.error("error adding note:", error);
+        res.status(500).json({error: "failed to add note"});
+    }
+});
+ 
+// POST/ activity-logs -- manually creates an activity log in MongoDb
+
+app.post("/activity-logs", async (req,res) => {
+    const {action, user_id, ticket_id, details} = req.body;
+    if(!action || !details) {
+        return res.status(400).json({error: "action and details are required"});
+    }
+    try {
+        const mongoDb = getMongo();
+        const result = await mongoDb.collection("activity_logs").insertOne({
+            action: action,
+            user_id: user_id || null,
+            ticket_id: ticket_id || null,
+            details: details,
+            timestamp: new Date()
+        });
+        res.status(201).json({
+            message: "activity log created",
+            logId: result.insertedId
+        });
+    } catch(error) {
+        console.error("error creating activity log:", error);
+        res.status(500).json({error: "failed to create activity log"});
+    }
+});
+ 
+// POST /login -- validates credentials and returns user info with role
+
+app.post("/login", async (req,res) => {
+    const {email, password} = req.body;
+    
+    // validate required fields
+
+    if(!email || !password) {
+        return res.status(400).json({error: "email and password are required"});
+    }
+    
+// look up user by email
+
+    const sql = "SELECT * FROM users WHERE email = ?";
+    db.query(sql, [email], async(error,results) => {
+        if(error) {
+            console.error("login query error:", error);
+            return res.status(500).json({error: "something went wrong"});
+        }
+// check if user exists
+
+        if(results.length === 0) {
+            return res.status(401).json({error: "invalid email or password"});
+        }
+        const user = results[0];
+        
+// check password
+
+        if(user.password !== password) {
+            return res.status(401).json({error: "invalid email or password"});
+        }
+// automatically log the login action to mongoDb
+
+        try {
+            const mongoDb = getMongo();
+            await mongoDb.collection("activity_logs").insertOne({
+                action: "user_login",
+                user_id: user.id,
+                ticket_id: null,
+                details: `${user.first_name} ${user.last_name} logged in as ${user.role}`,
+                timestamp: new Date()
+            });
+        } catch (mongoError) {
+            console.error("failed to log login activity:", mongoError);
+
+// do not fail the login logging fails
+
+        }
+
+// return user info including role
+
+        res.status(200).json({
+            message: "login successful",
+            first_name: user.first_name,
+            last_name: user.last_name,
+            role: user.role,
+            user_id: user.id
+        });
     });
 });
 
